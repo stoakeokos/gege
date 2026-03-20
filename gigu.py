@@ -2,17 +2,24 @@
 Automated browser session manager with geolocation-aware CDP mode.
 
 Usage:
-    python session_manager.py --url "https://example.com" [--proxy socks5://host:port] [--max-sessions 2] [--brave] [--incognito]
+    python session_manager.py --url "https://example.com" [OPTIONS]
+
+Examples:
+    python session_manager.py --url "https://example.com" --brave --incognito
+    python session_manager.py --url "https://example.com" --xvfb --screenshot
+    python session_manager.py --url "https://example.com" --brave --incognito --xvfb --screenshot --proxy socks5://127.0.0.1:9050
 """
 
 import argparse
 import base64
 import logging
+import os
+import platform
 import random
 import sys
 import time
-import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -74,6 +81,8 @@ class SessionConfig:
     disable_webgl: bool = True
     use_brave: bool = False
     incognito: bool = False
+    xvfb: bool = False
+    screenshot: bool = False
     idle_range: tuple[int, int] = (450, 800)
     max_sessions_per_cycle: int = 2
     consent_button_selector: str = 'button:contains("Accept")'
@@ -93,6 +102,20 @@ class SessionConfig:
         if self.incognito:
             args.append("--incognito")
         return ",".join(args) if args else ""
+
+    def validate(self) -> None:
+        """Raise on invalid or incompatible flag combinations."""
+        if self.xvfb and platform.system() != "Linux":
+            raise SystemExit(
+                "--xvfb is only supported on Linux (requires Xvfb). "
+                f"Current platform: {platform.system()}"
+            )
+
+        if self.screenshot and not self.xvfb:
+            logger.warning(
+                "--screenshot works best with --xvfb on headless servers. "
+                "Proceeding anyway, but screenshots may capture a visible desktop."
+            )
 
 
 # ─── Core Logic ─────────────────────────────────────────────────────────────
@@ -128,8 +151,8 @@ class BrowserSessionManager:
     def _build_sb_kwargs(self) -> dict:
         """
         Construct the keyword arguments dict for the SB() context manager.
-        Brave and incognito are handled here so the rest of the code
-        stays browser-agnostic.
+        Browser choice, display mode, and screenshot options are all
+        centralised here so the rest of the code stays agnostic.
         """
         cfg = self._config
 
@@ -142,7 +165,7 @@ class BrowserSessionManager:
 
         # ── Brave ────────────────────────────────────────────────────
         if cfg.use_brave:
-            kwargs["browser"] = "chrome"           # Brave is Chromium-based
+            kwargs["browser"] = "chrome"
             kwargs["binary_location"] = _resolve_brave_binary()
             logger.info("Using Brave at: %s", kwargs["binary_location"])
 
@@ -150,6 +173,16 @@ class BrowserSessionManager:
         chromium_args = cfg.chromium_args
         if chromium_args:
             kwargs["chromium_arg"] = chromium_args
+
+        # ── Xvfb (Linux virtual framebuffer) ─────────────────────────
+        if cfg.xvfb:
+            kwargs["xvfb"] = True
+            logger.info("Xvfb virtual display enabled (headless Linux mode)")
+
+        # ── Screenshots ──────────────────────────────────────────────
+        if cfg.screenshot:
+            kwargs["screenshot_after_test"] = True
+            logger.info("Screenshots will be saved after each session")
 
         return kwargs
 
@@ -173,6 +206,7 @@ class BrowserSessionManager:
 
             if not driver.is_element_present(cfg.stream_indicator_selector):
                 logger.warning("Stream indicator not found — stream may be offline.")
+                self._take_debug_screenshot(driver, "offline_check")
                 return False
 
             logger.info("Stream is live. Spawning %d extra session(s).", cfg.max_sessions_per_cycle - 1)
@@ -241,6 +275,17 @@ class BrowserSessionManager:
                 logger.warning("Element found but click failed: %s", selector)
         return False
 
+    def _take_debug_screenshot(self, driver, label: str) -> None:
+        """Save a timestamped debug screenshot when --screenshot is active."""
+        if not self._config.screenshot:
+            return
+        try:
+            filename = f"debug_{label}_{int(time.time())}.png"
+            driver.save_screenshot(filename)
+            logger.info("Debug screenshot saved: %s", filename)
+        except Exception:
+            logger.warning("Failed to save debug screenshot: %s", label)
+
 
 # ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -249,9 +294,6 @@ def _resolve_brave_binary() -> str:
     Return the Brave binary path for the current platform.
     Raises FileNotFoundError if Brave isn't installed at any known location.
     """
-    import platform
-    from pathlib import Path
-
     candidates: list[Path] = []
     system = platform.system()
 
@@ -270,7 +312,9 @@ def _resolve_brave_binary() -> str:
         for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             base = os.environ.get(env_var)
             if base:
-                candidates.append(Path(base) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe")
+                candidates.append(
+                    Path(base) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"
+                )
 
     for path in candidates:
         if path.exists():
@@ -293,12 +337,29 @@ def decode_target(encoded: str) -> str:
 # ─── Entry Point ────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Geo-aware browser session manager")
+    parser = argparse.ArgumentParser(
+        description="Geo-aware browser session manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  %(prog)s --url "https://example.com" --brave --incognito
+  %(prog)s --url "https://example.com" --xvfb --screenshot
+  %(prog)s --url "https://example.com" --brave --incognito --xvfb --screenshot
+        """,
+    )
+
+    # ── Required ─────────────────────────────────────────────────────
     parser.add_argument("--url", required=True, help="Target URL to open")
+
+    # ── Network ──────────────────────────────────────────────────────
     parser.add_argument("--proxy", default=None, help="Proxy string (e.g. socks5://host:port)")
-    parser.add_argument("--max-sessions", type=int, default=2, help="Browser instances per cycle")
-    parser.add_argument("--idle-min", type=int, default=450, help="Min idle seconds")
-    parser.add_argument("--idle-max", type=int, default=800, help="Max idle seconds")
+
+    # ── Session tuning ───────────────────────────────────────────────
+    parser.add_argument("--max-sessions", type=int, default=2, help="Browser instances per cycle (default: 2)")
+    parser.add_argument("--idle-min", type=int, default=450, help="Min idle seconds (default: 450)")
+    parser.add_argument("--idle-max", type=int, default=800, help="Max idle seconds (default: 800)")
+
+    # ── Browser selection ────────────────────────────────────────────
     parser.add_argument(
         "--brave",
         action="store_true",
@@ -311,6 +372,21 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Launch browser in incognito / private mode",
     )
+
+    # ── Linux display & debugging ────────────────────────────────────
+    parser.add_argument(
+        "--xvfb",
+        action="store_true",
+        default=False,
+        help="Run inside Xvfb virtual framebuffer (Linux only — ideal for headless servers)",
+    )
+    parser.add_argument(
+        "--screenshot",
+        action="store_true",
+        default=False,
+        help="Save screenshots after each session and on errors (pairs well with --xvfb)",
+    )
+
     return parser.parse_args()
 
 
@@ -328,11 +404,18 @@ def main() -> None:
         max_sessions_per_cycle=args.max_sessions,
         use_brave=args.brave,
         incognito=args.incognito,
+        xvfb=args.xvfb,
+        screenshot=args.screenshot,
     )
+
+    # ── Validate before starting ─────────────────────────────────────
+    config.validate()
 
     browser_label = "Brave" if config.use_brave else "Chrome"
     mode_label = " (incognito)" if config.incognito else ""
-    logger.info("Browser: %s%s", browser_label, mode_label)
+    display_label = " [xvfb]" if config.xvfb else ""
+    screenshot_label = " [screenshots on]" if config.screenshot else ""
+    logger.info("Browser: %s%s%s%s", browser_label, mode_label, display_label, screenshot_label)
 
     manager = BrowserSessionManager(config, geo)
     manager.run_forever()
