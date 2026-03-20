@@ -166,7 +166,7 @@ jobs:
     # ── Main run ─────────────────────────────────────────────────────
     - name: Run python --debug
       run: |
-        python gigu.py --brave --incognito --xvfb --url twitch.tv/warn
+        python gigu.py --brave --incognito --xvfb --url twitch.tv/brutalles
 
     # ── Always upload artifacts (even on failure) ────────────────────
     - name: Upload screenshots
