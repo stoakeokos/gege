@@ -2,7 +2,7 @@
 Automated browser session manager with geolocation-aware CDP mode.
 
 Usage:
-    python session_manager.py --url "https://example.com" [--proxy socks5://host:port] [--max-sessions 2]
+    python session_manager.py --url "https://example.com" [--proxy socks5://host:port] [--max-sessions 2] [--brave] [--incognito]
 """
 
 import argparse
@@ -11,6 +11,7 @@ import logging
 import random
 import sys
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -71,6 +72,8 @@ class SessionConfig:
     locale: str = "en"
     ad_block: bool = True
     disable_webgl: bool = True
+    use_brave: bool = False
+    incognito: bool = False
     idle_range: tuple[int, int] = (450, 800)
     max_sessions_per_cycle: int = 2
     consent_button_selector: str = 'button:contains("Accept")'
@@ -80,6 +83,16 @@ class SessionConfig:
     stream_load_delay: float = 12.0
     post_action_delay: float = 10.0
     button_click_timeout: float = 4.0
+
+    @property
+    def chromium_args(self) -> str:
+        """Build the chromium arg string from config flags."""
+        args: list[str] = []
+        if self.disable_webgl:
+            args.append("--disable-webgl")
+        if self.incognito:
+            args.append("--incognito")
+        return ",".join(args) if args else ""
 
 
 # ─── Core Logic ─────────────────────────────────────────────────────────────
@@ -112,6 +125,34 @@ class BrowserSessionManager:
 
     # ── Private helpers ──────────────────────────────────────────────────
 
+    def _build_sb_kwargs(self) -> dict:
+        """
+        Construct the keyword arguments dict for the SB() context manager.
+        Brave and incognito are handled here so the rest of the code
+        stays browser-agnostic.
+        """
+        cfg = self._config
+
+        kwargs: dict = {
+            "uc": True,
+            "locale": cfg.locale,
+            "ad_block": cfg.ad_block,
+            "proxy": cfg.proxy if cfg.proxy else False,
+        }
+
+        # ── Brave ────────────────────────────────────────────────────
+        if cfg.use_brave:
+            kwargs["browser"] = "chrome"           # Brave is Chromium-based
+            kwargs["binary_location"] = _resolve_brave_binary()
+            logger.info("Using Brave at: %s", kwargs["binary_location"])
+
+        # ── Chromium args (--disable-webgl, --incognito, …) ──────────
+        chromium_args = cfg.chromium_args
+        if chromium_args:
+            kwargs["chromium_arg"] = chromium_args
+
+        return kwargs
+
     def _run_cycle(self) -> bool:
         """
         Open a primary browser, optionally spawn secondary sessions,
@@ -120,15 +161,9 @@ class BrowserSessionManager:
         Returns True if the stream was live, False otherwise.
         """
         cfg = self._config
-        chromium_args = "--disable-webgl" if cfg.disable_webgl else ""
+        sb_kwargs = self._build_sb_kwargs()
 
-        with SB(
-            uc=True,
-            locale=cfg.locale,
-            ad_block=cfg.ad_block,
-            chromium_arg=chromium_args,
-            proxy=cfg.proxy if cfg.proxy else False,
-        ) as driver:
+        with SB(**sb_kwargs) as driver:
             self._activate_with_geo(driver)
             self._dismiss_consent(driver)
 
@@ -149,7 +184,6 @@ class BrowserSessionManager:
             logger.info("Idling for %d s…", idle_seconds)
             driver.sleep(idle_seconds)
 
-            # Extra drivers are cleaned up when the `with` block exits.
             del extra_drivers
 
         return True
@@ -210,6 +244,44 @@ class BrowserSessionManager:
 
 # ─── Utilities ──────────────────────────────────────────────────────────────
 
+def _resolve_brave_binary() -> str:
+    """
+    Return the Brave binary path for the current platform.
+    Raises FileNotFoundError if Brave isn't installed at any known location.
+    """
+    import platform
+    from pathlib import Path
+
+    candidates: list[Path] = []
+    system = platform.system()
+
+    if system == "Linux":
+        candidates = [
+            Path("/usr/bin/brave-browser"),
+            Path("/usr/bin/brave"),
+            Path("/snap/bin/brave"),
+            Path.home() / ".local/bin/brave",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+        ]
+    elif system == "Windows":
+        for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_var)
+            if base:
+                candidates.append(Path(base) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe")
+
+    for path in candidates:
+        if path.exists():
+            return str(path)
+
+    raise FileNotFoundError(
+        f"Brave binary not found. Searched: {[str(p) for p in candidates]}. "
+        "Install Brave or pass a custom path."
+    )
+
+
 def decode_target(encoded: str) -> str:
     """Decode a base64-encoded channel name."""
     try:
@@ -227,6 +299,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sessions", type=int, default=2, help="Browser instances per cycle")
     parser.add_argument("--idle-min", type=int, default=450, help="Min idle seconds")
     parser.add_argument("--idle-max", type=int, default=800, help="Max idle seconds")
+    parser.add_argument(
+        "--brave",
+        action="store_true",
+        default=False,
+        help="Use Brave browser instead of Chrome",
+    )
+    parser.add_argument(
+        "--incognito",
+        action="store_true",
+        default=False,
+        help="Launch browser in incognito / private mode",
+    )
     return parser.parse_args()
 
 
@@ -242,7 +326,13 @@ def main() -> None:
         proxy=args.proxy,
         idle_range=(args.idle_min, args.idle_max),
         max_sessions_per_cycle=args.max_sessions,
+        use_brave=args.brave,
+        incognito=args.incognito,
     )
+
+    browser_label = "Brave" if config.use_brave else "Chrome"
+    mode_label = " (incognito)" if config.incognito else ""
+    logger.info("Browser: %s%s", browser_label, mode_label)
 
     manager = BrowserSessionManager(config, geo)
     manager.run_forever()
