@@ -1,0 +1,180 @@
+name: FGGE
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    branches:
+jobs:
+  build:
+    env:
+      PY_COLORS: "1"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.13"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install WARP
+      run: |
+        echo "Setting up Cloudflare WARP..."
+        sudo apt-get -y update
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+        sudo apt-get update && sudo apt-get install -y --no-install-recommends cloudflare-warp
+        sudo warp-cli --accept-tos registration new
+        sudo warp-cli --accept-tos mode warp+doh
+        sudo warp-cli --accept-tos connect
+        sleep 5
+      shell: bash
+
+    - name: Ensure connection is WARP'ed
+      run: |
+        echo "Checking WARP connection..."
+        curl -s https://www.cloudflare.com/cdn-cgi/trace | grep "warp=on"
+      shell: bash
+
+    - name: Set Locale
+      run: |
+        sudo apt-get install tzdata locales -y && sudo locale-gen en_US.UTF-8
+        sudo localectl set-locale LANG="en_US.UTF-8"
+        export LANG="en_US.UTF-8"
+        sudo update-locale
+        locale -a
+        locale
+        locale -c -k LC_NUMERIC
+        localectl status
+
+    # ── Brave Browser Installation ───────────────────────────────────
+    - name: Install Brave Browser
+      run: |
+        echo "Installing Brave Browser..."
+        sudo apt-get install -y curl software-properties-common apt-transport-https
+
+        # Import Brave GPG key
+        curl -fsSL https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg \
+          | sudo tee /usr/share/keyrings/brave-browser-archive-keyring.gpg > /dev/null
+
+        # Add Brave repository
+        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+          | sudo tee /etc/apt/sources.list.d/brave-browser-release.list
+
+        # Install
+        sudo apt-get update
+        sudo apt-get install -y brave-browser
+      shell: bash
+
+    - name: Verify Brave installation
+      run: |
+        echo "── Binary location ──"
+        which brave-browser
+        ls -la /usr/bin/brave-browser
+
+        echo "── Version ──"
+        brave-browser --version
+
+        echo "── Sanity: headless smoke test ──"
+        # Quick launch-and-exit to confirm it doesn't segfault on the runner
+        timeout 10 brave-browser --headless --disable-gpu --dump-dom about:blank > /dev/null 2>&1 || true
+        echo "Brave is ready."
+      shell: bash
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install --upgrade pip
+        pip install --upgrade wheel
+        pip install --upgrade seleniumbase
+        pip install --upgrade pyautogui
+        pip install --upgrade pymongo
+        pip install --upgrade python-xlib
+
+    # ── Driver installation (Chrome + Brave share chromedriver) ──────
+    - name: Install chromedriver
+      run: |
+        seleniumbase install chromedriver
+        echo "── Chromedriver version ──"
+        chromedriver --version || true
+
+    # ── Pre-flight tests (won't break the workflow) ──────────────────
+    - name: Test — Brave + SeleniumBase basic launch
+      continue-on-error: true
+      run: |
+        python -c "
+        from seleniumbase import SB
+        print('Testing: Brave + incognito + xvfb launch...')
+        with SB(
+            uc=True,
+            browser='chrome',
+            binary_location='/usr/bin/brave-browser',
+            chromium_arg='--incognito,--disable-webgl',
+            xvfb=True,
+            screenshot_after_test=True,
+        ) as sb:
+            sb.open('https://www.google.com')
+            sb.sleep(3)
+            title = sb.get_title()
+            print(f'Page title: {title}')
+            assert 'Google' in title, f'Unexpected title: {title}'
+            sb.save_screenshot('test_brave_launch.png')
+            print('PASS: Brave launched successfully under Xvfb.')
+        "
+      shell: bash
+
+    - name: Test — Geolocation API reachable
+      continue-on-error: true
+      run: |
+        python -c "
+        import requests, json
+        resp = requests.get('http://ip-api.com/json/', timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        assert data['status'] == 'success', f'ip-api failed: {data}'
+        print(f'GeoIP OK — {data[\"city\"]}, {data[\"country\"]} (TZ: {data[\"timezone\"]})')
+        print(f'WARP IP: {data[\"query\"]}')
+        "
+      shell: bash
+
+    - name: Test — Xvfb availability
+      continue-on-error: true
+      run: |
+        echo "── Checking Xvfb ──"
+        which Xvfb && Xvfb -help 2>&1 | head -5 || echo "Xvfb not found — seleniumbase will handle it"
+
+        echo "── Checking virtual display start ──"
+        Xvfb :99 -screen 0 1920x1080x24 &
+        XVFB_PID=$!
+        sleep 2
+        if kill -0 $XVFB_PID 2>/dev/null; then
+          echo "PASS: Xvfb :99 is running (PID $XVFB_PID)"
+          kill $XVFB_PID
+        else
+          echo "WARN: Xvfb failed to start"
+        fi
+      shell: bash
+
+    # ── Main run ─────────────────────────────────────────────────────
+    - name: Run python --debug
+      run: |
+        python gigu.py --brave --incognito --xvfb --screenshot --url twitch.tv/brutalles
+
+    # ── Always upload artifacts (even on failure) ────────────────────
+    - name: Upload screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: seleniumbase-screenshots
+        path: |
+          ./latest_logs/
+          ./*.png
+        if-no-files-found: ignore
