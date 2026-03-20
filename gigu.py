@@ -1,0 +1,252 @@
+"""
+Automated browser session manager with geolocation-aware CDP mode.
+
+Usage:
+    python session_manager.py --url "https://example.com" [--proxy socks5://host:port] [--max-sessions 2]
+"""
+
+import argparse
+import base64
+import logging
+import random
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+import requests
+from requests.exceptions import RequestException
+from seleniumbase import SB
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class GeoData:
+    """Immutable geolocation context resolved from the host's public IP."""
+    latitude: float
+    longitude: float
+    timezone_id: str
+    country_code: str
+
+    @classmethod
+    def from_ip_api(cls, timeout: int = 10) -> "GeoData":
+        """Fetch geolocation from ip-api.com with error handling."""
+        try:
+            response = requests.get(
+                "http://ip-api.com/json/",
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("status") != "success":
+                raise ValueError(f"ip-api returned failure: {data.get('message', 'unknown')}")
+
+            return cls(
+                latitude=data["lat"],
+                longitude=data["lon"],
+                timezone_id=data["timezone"],
+                country_code=data["countryCode"].lower(),
+            )
+        except (RequestException, KeyError, ValueError) as exc:
+            logger.error("Failed to resolve geolocation: %s", exc)
+            raise SystemExit(1) from exc
+
+
+@dataclass
+class SessionConfig:
+    """All tunables for a browser session, gathered in one place."""
+    target_url: str
+    proxy: Optional[str] = None
+    locale: str = "en"
+    ad_block: bool = True
+    disable_webgl: bool = True
+    idle_range: tuple[int, int] = (450, 800)
+    max_sessions_per_cycle: int = 2
+    consent_button_selector: str = 'button:contains("Accept")'
+    start_button_selector: str = 'button:contains("Start Watching")'
+    stream_indicator_selector: str = "#live-channel-stream-information"
+    page_load_delay: float = 2.0
+    stream_load_delay: float = 12.0
+    post_action_delay: float = 10.0
+    button_click_timeout: float = 4.0
+
+
+# ─── Core Logic ─────────────────────────────────────────────────────────────
+
+class BrowserSessionManager:
+    """Manages geolocation-aware browser sessions with CDP mode."""
+
+    def __init__(self, config: SessionConfig, geo: GeoData) -> None:
+        self._config = config
+        self._geo = geo
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def run_forever(self) -> None:
+        """Main loop: open sessions until the stream goes offline."""
+        cycle = 0
+        while True:
+            cycle += 1
+            logger.info("── Cycle %d ──", cycle)
+
+            try:
+                stream_live = self._run_cycle()
+            except Exception:
+                logger.exception("Unhandled error in cycle %d — restarting", cycle)
+                continue
+
+            if not stream_live:
+                logger.info("Stream appears offline. Exiting.")
+                break
+
+    # ── Private helpers ──────────────────────────────────────────────────
+
+    def _run_cycle(self) -> bool:
+        """
+        Open a primary browser, optionally spawn secondary sessions,
+        idle for a random duration, then tear down.
+
+        Returns True if the stream was live, False otherwise.
+        """
+        cfg = self._config
+        chromium_args = "--disable-webgl" if cfg.disable_webgl else ""
+
+        with SB(
+            uc=True,
+            locale=cfg.locale,
+            ad_block=cfg.ad_block,
+            chromium_arg=chromium_args,
+            proxy=cfg.proxy if cfg.proxy else False,
+        ) as driver:
+            self._activate_with_geo(driver)
+            self._dismiss_consent(driver)
+
+            driver.sleep(cfg.stream_load_delay)
+            self._click_if_present(driver, cfg.start_button_selector, post_delay=cfg.post_action_delay)
+            self._dismiss_consent(driver)
+
+            if not driver.is_element_present(cfg.stream_indicator_selector):
+                logger.warning("Stream indicator not found — stream may be offline.")
+                return False
+
+            logger.info("Stream is live. Spawning %d extra session(s).", cfg.max_sessions_per_cycle - 1)
+            self._dismiss_consent(driver)
+
+            extra_drivers = self._spawn_extra_sessions(driver)
+
+            idle_seconds = random.randint(*cfg.idle_range)
+            logger.info("Idling for %d s…", idle_seconds)
+            driver.sleep(idle_seconds)
+
+            # Extra drivers are cleaned up when the `with` block exits.
+            del extra_drivers
+
+        return True
+
+    def _spawn_extra_sessions(self, primary_driver) -> list:
+        """Open additional browser windows reusing the primary driver context."""
+        cfg = self._config
+        extras = []
+
+        for i in range(1, cfg.max_sessions_per_cycle):
+            logger.info("Spawning extra session %d…", i)
+            try:
+                extra = primary_driver.get_new_driver(undetectable=True)
+                self._activate_with_geo(extra)
+                extra.sleep(cfg.post_action_delay)
+
+                self._click_if_present(extra, cfg.start_button_selector, post_delay=cfg.post_action_delay)
+                self._dismiss_consent(extra)
+
+                extras.append(extra)
+            except Exception:
+                logger.exception("Failed to spawn extra session %d", i)
+
+        return extras
+
+    def _activate_with_geo(self, driver) -> None:
+        """Activate CDP mode with geolocation and timezone spoofing."""
+        cfg = self._config
+        driver.activate_cdp_mode(
+            cfg.target_url,
+            tzone=self._geo.timezone_id,
+            geoloc=(self._geo.latitude, self._geo.longitude),
+        )
+        driver.sleep(cfg.page_load_delay)
+
+    def _dismiss_consent(self, driver) -> None:
+        """Click away cookie / consent banners if present."""
+        self._click_if_present(driver, self._config.consent_button_selector)
+
+    def _click_if_present(
+        self,
+        driver,
+        selector: str,
+        post_delay: float = 0.0,
+    ) -> bool:
+        """Click an element if it exists. Returns True if clicked."""
+        if driver.is_element_present(selector):
+            try:
+                driver.cdp.click(selector, timeout=self._config.button_click_timeout)
+                logger.debug("Clicked: %s", selector)
+                if post_delay:
+                    driver.sleep(post_delay)
+                return True
+            except Exception:
+                logger.warning("Element found but click failed: %s", selector)
+        return False
+
+
+# ─── Utilities ──────────────────────────────────────────────────────────────
+
+def decode_target(encoded: str) -> str:
+    """Decode a base64-encoded channel name."""
+    try:
+        return base64.b64decode(encoded).decode("utf-8")
+    except Exception as exc:
+        raise ValueError(f"Failed to decode target: {exc}") from exc
+
+
+# ─── Entry Point ────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Geo-aware browser session manager")
+    parser.add_argument("--url", required=True, help="Target URL to open")
+    parser.add_argument("--proxy", default=None, help="Proxy string (e.g. socks5://host:port)")
+    parser.add_argument("--max-sessions", type=int, default=2, help="Browser instances per cycle")
+    parser.add_argument("--idle-min", type=int, default=450, help="Min idle seconds")
+    parser.add_argument("--idle-max", type=int, default=800, help="Max idle seconds")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    logger.info("Resolving geolocation…")
+    geo = GeoData.from_ip_api()
+    logger.info("Geo: %s / %s  TZ=%s", geo.latitude, geo.longitude, geo.timezone_id)
+
+    config = SessionConfig(
+        target_url=args.url,
+        proxy=args.proxy,
+        idle_range=(args.idle_min, args.idle_max),
+        max_sessions_per_cycle=args.max_sessions,
+    )
+
+    manager = BrowserSessionManager(config, geo)
+    manager.run_forever()
+
+
+if __name__ == "__main__":
+    main()
